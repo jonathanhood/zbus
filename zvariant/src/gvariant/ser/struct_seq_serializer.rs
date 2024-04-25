@@ -6,13 +6,13 @@ use std::{
 
 use crate::{Error, Result};
 
-use super::{seq_serializer::SeqSerializer, struct_serializer::StructSerializer};
+use super::{array_serializer::ArraySerializer, struct_serializer::StructSerializer};
 
 #[doc(hidden)]
 /// Allows us to serialize a struct as an ARRAY.
 pub enum StructSeqSerializer<'ser, 'sig, 'b, W> {
     Struct(StructSerializer<'ser, 'sig, 'b, W>),
-    Seq(SeqSerializer<'ser, 'sig, 'b, W>),
+    Seq(ArraySerializer<'ser, 'sig, 'b, W>),
 }
 
 macro_rules! serialize_struct_anon_fields {

@@ -1,4 +1,5 @@
-mod seq_serializer;
+mod array_serializer;
+mod dict_serializer;
 mod struct_seq_serializer;
 mod struct_serializer;
 
@@ -18,8 +19,8 @@ use crate::{
 };
 
 use self::{
-    seq_serializer::SeqSerializer, struct_seq_serializer::StructSeqSerializer,
-    struct_serializer::StructSerializer,
+    array_serializer::ArraySerializer, dict_serializer::DictSerializer,
+    struct_seq_serializer::StructSeqSerializer, struct_serializer::StructSerializer,
 };
 
 /// Our serialization implementation.
@@ -130,11 +131,11 @@ where
     type Ok = ();
     type Error = Error;
 
-    type SerializeSeq = SeqSerializer<'ser, 'sig, 'b, W>;
+    type SerializeSeq = ArraySerializer<'ser, 'sig, 'b, W>;
     type SerializeTuple = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeTupleStruct = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeTupleVariant = StructSeqSerializer<'ser, 'sig, 'b, W>;
-    type SerializeMap = SeqSerializer<'ser, 'sig, 'b, W>;
+    type SerializeMap = DictSerializer<'ser, 'sig, 'b, W>;
     type SerializeStruct = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeStructVariant = StructSeqSerializer<'ser, 'sig, 'b, W>;
 
@@ -285,24 +286,16 @@ where
         let fixed_sized_child = crate::utils::is_fixed_sized_signature(&element_signature)?;
         let offsets = (!fixed_sized_child).then(FramingOffsets::new);
 
-        let key_start = if self.0.sig_parser.next_char()? == DICT_ENTRY_SIG_START_CHAR {
-            let key_signature = Signature::from_str_unchecked(&element_signature[1..2]);
-            (!crate::utils::is_fixed_sized_signature(&key_signature)?).then_some(0)
-        } else {
-            None
-        };
         self.0.add_padding(element_alignment)?;
         self.0.container_depths = self.0.container_depths.inc_array()?;
 
         let start = self.0.bytes_written;
 
-        Ok(SeqSerializer {
+        Ok(ArraySerializer {
             ser: self,
             start,
-            element_alignment,
             element_signature_len,
             offsets,
-            key_start,
         })
     }
 
@@ -330,8 +323,34 @@ where
         StructSerializer::enum_variant(self).map(StructSeqSerializer::Struct)
     }
 
-    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
-        self.serialize_seq(len)
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
+        self.0.sig_parser.skip_char()?;
+        let element_signature = self.0.sig_parser.next_signature()?;
+        let element_signature_len = element_signature.len();
+        let element_alignment = alignment_for_signature(&element_signature, self.0.ctxt.format())?;
+
+        let fixed_sized_child = crate::utils::is_fixed_sized_signature(&element_signature)?;
+        let offsets = (!fixed_sized_child).then(FramingOffsets::new);
+
+        let key_start = if self.0.sig_parser.next_char()? == DICT_ENTRY_SIG_START_CHAR {
+            let key_signature = Signature::from_str_unchecked(&element_signature[1..2]);
+            (!crate::utils::is_fixed_sized_signature(&key_signature)?).then_some(0)
+        } else {
+            None
+        };
+        self.0.add_padding(element_alignment)?;
+        self.0.container_depths = self.0.container_depths.inc_array()?;
+
+        let start = self.0.bytes_written;
+
+        Ok(DictSerializer {
+            ser: self,
+            start,
+            element_alignment,
+            element_signature_len,
+            offsets,
+            key_start,
+        })
     }
 
     fn serialize_struct(self, _name: &'static str, len: usize) -> Result<Self::SerializeStruct> {

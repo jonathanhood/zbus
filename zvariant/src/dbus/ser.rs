@@ -1,4 +1,5 @@
-mod seq_serializer;
+mod array_serializer;
+mod dict_serializer;
 mod struct_seq_serializer;
 mod struct_serializer;
 
@@ -17,8 +18,8 @@ use crate::{
 };
 
 use self::{
-    seq_serializer::SeqSerializer, struct_seq_serializer::StructSeqSerializer,
-    struct_serializer::StructSerializer,
+    array_serializer::ArraySerializer, dict_serializer::DictSerializer,
+    struct_seq_serializer::StructSeqSerializer, struct_serializer::StructSerializer,
 };
 
 #[cfg(unix)]
@@ -82,11 +83,11 @@ where
     type Ok = ();
     type Error = Error;
 
-    type SerializeSeq = SeqSerializer<'ser, 'sig, 'b, W>;
+    type SerializeSeq = ArraySerializer<'ser, 'sig, 'b, W>;
     type SerializeTuple = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeTupleStruct = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeTupleVariant = StructSeqSerializer<'ser, 'sig, 'b, W>;
-    type SerializeMap = SeqSerializer<'ser, 'sig, 'b, W>;
+    type SerializeMap = DictSerializer<'ser, 'sig, 'b, W>;
     type SerializeStruct = StructSeqSerializer<'ser, 'sig, 'b, W>;
     type SerializeStructVariant = StructSeqSerializer<'ser, 'sig, 'b, W>;
 
@@ -292,11 +293,10 @@ where
         let start = self.0.bytes_written;
         self.0.container_depths = self.0.container_depths.inc_array()?;
 
-        Ok(SeqSerializer::new(
+        Ok(ArraySerializer::new(
             self,
             start,
             element_signature_len,
-            element_alignment,
             first_padding,
         ))
     }
@@ -325,8 +325,32 @@ where
         StructSerializer::enum_variant(self).map(StructSeqSerializer::Struct)
     }
 
-    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
-        self.serialize_seq(len)
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
+        self.0.sig_parser.skip_char()?;
+        self.0.add_padding(ARRAY_ALIGNMENT_DBUS)?;
+        // Length in bytes (unfortunately not the same as len passed to us here) which we
+        // initially set to 0.
+        self.0
+            .write_u32(self.0.ctxt.endian(), 0_u32)
+            .map_err(|e| Error::InputOutput(e.into()))?;
+
+        let element_signature = self.0.sig_parser.next_signature()?;
+        let element_signature_len = element_signature.len();
+        let element_alignment = alignment_for_signature(&element_signature, self.0.ctxt.format())?;
+
+        // D-Bus expects us to add padding for the first element even when there is no first
+        // element (i-e empty array) so we add padding already.
+        let first_padding = self.0.add_padding(element_alignment)?;
+        let start = self.0.bytes_written;
+        self.0.container_depths = self.0.container_depths.inc_array()?;
+
+        Ok(DictSerializer::new(
+            self,
+            start,
+            element_signature_len,
+            element_alignment,
+            first_padding,
+        ))
     }
 
     fn serialize_struct(self, _name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
