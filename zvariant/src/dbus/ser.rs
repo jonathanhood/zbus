@@ -1,3 +1,7 @@
+mod seq_serializer;
+mod struct_seq_serializer;
+mod struct_serializer;
+
 use serde::{ser, ser::SerializeSeq, Serialize};
 use static_assertions::assert_impl_all;
 use std::{
@@ -6,11 +10,15 @@ use std::{
 };
 
 use crate::{
-    container_depths::ContainerDepths,
     serialized::{Context, Format},
     signature_parser::SignatureParser,
     utils::*,
     Basic, Error, ObjectPath, Result, Signature, WriteBytes,
+};
+
+use self::{
+    seq_serializer::SeqSerializer, struct_seq_serializer::StructSeqSerializer,
+    struct_serializer::StructSerializer,
 };
 
 #[cfg(unix)]
@@ -284,13 +292,13 @@ where
         let start = self.0.bytes_written;
         self.0.container_depths = self.0.container_depths.inc_array()?;
 
-        Ok(SeqSerializer {
-            ser: self,
+        Ok(SeqSerializer::new(
+            self,
             start,
-            element_alignment,
             element_signature_len,
+            element_alignment,
             first_padding,
-        })
+        ))
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
@@ -351,354 +359,3 @@ where
         false
     }
 }
-
-#[doc(hidden)]
-pub struct SeqSerializer<'ser, 'sig, 'b, W> {
-    ser: &'b mut Serializer<'ser, 'sig, W>,
-    start: usize,
-    // alignment of element
-    element_alignment: usize,
-    // size of element signature
-    element_signature_len: usize,
-    // First element's padding
-    first_padding: usize,
-}
-
-impl<'ser, 'sig, 'b, W> SeqSerializer<'ser, 'sig, 'b, W>
-where
-    W: Write + Seek,
-{
-    pub(self) fn end_seq(self) -> Result<()> {
-        self.ser
-            .0
-            .sig_parser
-            .skip_chars(self.element_signature_len)?;
-
-        // Set size of array in bytes
-        let array_len = self.ser.0.bytes_written - self.start;
-        let len = usize_to_u32(array_len);
-        let total_array_len = (array_len + self.first_padding + 4) as i64;
-        self.ser
-            .0
-            .writer
-            .seek(std::io::SeekFrom::Current(-total_array_len))
-            .map_err(|e| Error::InputOutput(e.into()))?;
-        self.ser
-            .0
-            .writer
-            .write_u32(self.ser.0.ctxt.endian(), len)
-            .map_err(|e| Error::InputOutput(e.into()))?;
-        self.ser
-            .0
-            .writer
-            .seek(std::io::SeekFrom::Current(total_array_len - 4))
-            .map_err(|e| Error::InputOutput(e.into()))?;
-
-        self.ser.0.container_depths = self.ser.0.container_depths.dec_array();
-
-        Ok(())
-    }
-}
-
-impl<'ser, 'sig, 'b, W> ser::SerializeSeq for SeqSerializer<'ser, 'sig, 'b, W>
-where
-    W: Write + Seek,
-{
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        // We want to keep parsing the same signature repeatedly for each element so we use a
-        // disposable clone.
-        let sig_parser = self.ser.0.sig_parser.clone();
-        self.ser.0.sig_parser = sig_parser.clone();
-
-        value.serialize(&mut *self.ser)?;
-        self.ser.0.sig_parser = sig_parser;
-
-        Ok(())
-    }
-
-    fn end(self) -> Result<()> {
-        self.end_seq()
-    }
-}
-
-#[doc(hidden)]
-pub struct StructSerializer<'ser, 'sig, 'b, W> {
-    ser: &'b mut Serializer<'ser, 'sig, W>,
-    // The number of `)` in the signature to skip at the end.
-    end_parens: u8,
-    // The original container depths. We restore to that at the end.
-    container_depths: ContainerDepths,
-}
-
-impl<'ser, 'sig, 'b, W> StructSerializer<'ser, 'sig, 'b, W>
-where
-    W: Write + Seek,
-{
-    fn variant(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
-        ser.0.add_padding(VARIANT_ALIGNMENT_DBUS)?;
-        let container_depths = ser.0.container_depths;
-        ser.0.container_depths = ser.0.container_depths.inc_variant()?;
-
-        Ok(Self {
-            ser,
-            end_parens: 0,
-            container_depths,
-        })
-    }
-
-    fn structure(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
-        let c = ser.0.sig_parser.next_char()?;
-        if c != STRUCT_SIG_START_CHAR && c != DICT_ENTRY_SIG_START_CHAR {
-            let expected = format!("`{STRUCT_SIG_START_STR}` or `{DICT_ENTRY_SIG_START_STR}`",);
-
-            return Err(serde::de::Error::invalid_type(
-                serde::de::Unexpected::Char(c),
-                &expected.as_str(),
-            ));
-        }
-
-        let signature = ser.0.sig_parser.next_signature()?;
-        let alignment = alignment_for_signature(&signature, Format::DBus)?;
-        ser.0.add_padding(alignment)?;
-
-        ser.0.sig_parser.skip_char()?;
-        let container_depths = ser.0.container_depths;
-        ser.0.container_depths = ser.0.container_depths.inc_structure()?;
-
-        Ok(Self {
-            ser,
-            end_parens: 1,
-            container_depths,
-        })
-    }
-
-    fn unit(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
-        // serialize as a `0u8`
-        serde::Serializer::serialize_u8(&mut *ser, 0)?;
-
-        let container_depths = ser.0.container_depths;
-        Ok(Self {
-            ser,
-            end_parens: 0,
-            container_depths,
-        })
-    }
-
-    fn enum_variant(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
-        let mut ser = Self::structure(ser)?;
-        ser.end_parens += 1;
-
-        Ok(ser)
-    }
-
-    fn serialize_struct_element<T>(&mut self, name: Option<&'static str>, value: &T) -> Result<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        match name {
-            Some("zvariant::Value::Value") => {
-                // Serializing the value of a Value, which means signature was serialized
-                // already, and also put aside for us to be picked here.
-                let signature = self
-                    .ser
-                    .0
-                    .value_sign
-                    .take()
-                    .expect("Incorrect Value encoding");
-
-                let sig_parser = SignatureParser::new(signature);
-                let bytes_written = self.ser.0.bytes_written;
-                let mut ser = Serializer(crate::SerializerCommon::<W> {
-                    ctxt: self.ser.0.ctxt,
-                    sig_parser,
-                    writer: self.ser.0.writer,
-                    #[cfg(unix)]
-                    fds: self.ser.0.fds,
-                    bytes_written,
-                    value_sign: None,
-                    container_depths: self.ser.0.container_depths,
-                });
-                value.serialize(&mut ser)?;
-                self.ser.0.bytes_written = ser.0.bytes_written;
-
-                Ok(())
-            }
-            _ => value.serialize(&mut *self.ser),
-        }
-    }
-
-    fn end_struct(self) -> Result<()> {
-        if self.end_parens > 0 {
-            self.ser.0.sig_parser.skip_chars(self.end_parens as usize)?;
-        }
-        // Restore the original container depths.
-        self.ser.0.container_depths = self.container_depths;
-
-        Ok(())
-    }
-}
-
-#[doc(hidden)]
-/// Allows us to serialize a struct as an ARRAY.
-pub enum StructSeqSerializer<'ser, 'sig, 'b, W> {
-    Struct(StructSerializer<'ser, 'sig, 'b, W>),
-    Seq(SeqSerializer<'ser, 'sig, 'b, W>),
-}
-
-macro_rules! serialize_struct_anon_fields {
-    ($trait:ident $method:ident) => {
-        impl<'ser, 'sig, 'b, W> ser::$trait for StructSerializer<'ser, 'sig, 'b, W>
-        where
-            W: Write + Seek,
-        {
-            type Ok = ();
-            type Error = Error;
-
-            fn $method<T>(&mut self, value: &T) -> Result<()>
-            where
-                T: ?Sized + Serialize,
-            {
-                self.serialize_struct_element(None, value)
-            }
-
-            fn end(self) -> Result<()> {
-                self.end_struct()
-            }
-        }
-
-        impl<'ser, 'sig, 'b, W> ser::$trait for StructSeqSerializer<'ser, 'sig, 'b, W>
-        where
-            W: Write + Seek,
-        {
-            type Ok = ();
-            type Error = Error;
-
-            fn $method<T>(&mut self, value: &T) -> Result<()>
-            where
-                T: ?Sized + Serialize,
-            {
-                match self {
-                    StructSeqSerializer::Struct(ser) => ser.$method(value),
-                    StructSeqSerializer::Seq(ser) => ser.serialize_element(value),
-                }
-            }
-
-            fn end(self) -> Result<()> {
-                match self {
-                    StructSeqSerializer::Struct(ser) => ser.end_struct(),
-                    StructSeqSerializer::Seq(ser) => ser.end_seq(),
-                }
-            }
-        }
-    };
-}
-serialize_struct_anon_fields!(SerializeTuple serialize_element);
-serialize_struct_anon_fields!(SerializeTupleStruct serialize_field);
-serialize_struct_anon_fields!(SerializeTupleVariant serialize_field);
-
-impl<'ser, 'sig, 'b, W> ser::SerializeMap for SeqSerializer<'ser, 'sig, 'b, W>
-where
-    W: Write + Seek,
-{
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_key<T>(&mut self, key: &T) -> Result<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.ser.0.add_padding(self.element_alignment)?;
-
-        // We want to keep parsing the same signature repeatedly for each key so we use a
-        // disposable clone.
-        let sig_parser = self.ser.0.sig_parser.clone();
-        self.ser.0.sig_parser = sig_parser.clone();
-
-        // skip `{`
-        self.ser.0.sig_parser.skip_char()?;
-
-        key.serialize(&mut *self.ser)?;
-        self.ser.0.sig_parser = sig_parser;
-
-        Ok(())
-    }
-
-    fn serialize_value<T>(&mut self, value: &T) -> Result<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        // We want to keep parsing the same signature repeatedly for each key so we use a
-        // disposable clone.
-        let sig_parser = self.ser.0.sig_parser.clone();
-        self.ser.0.sig_parser = sig_parser.clone();
-
-        // skip `{` and key char
-        self.ser.0.sig_parser.skip_chars(2)?;
-
-        value.serialize(&mut *self.ser)?;
-        // Restore the original parser
-        self.ser.0.sig_parser = sig_parser;
-
-        Ok(())
-    }
-
-    fn end(self) -> Result<()> {
-        self.end_seq()
-    }
-}
-
-macro_rules! serialize_struct_named_fields {
-    ($trait:ident) => {
-        impl<'ser, 'sig, 'b, W> ser::$trait for StructSerializer<'ser, 'sig, 'b, W>
-        where
-            W: Write + Seek,
-        {
-            type Ok = ();
-            type Error = Error;
-
-            fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<()>
-            where
-                T: ?Sized + Serialize,
-            {
-                self.serialize_struct_element(Some(key), value)
-            }
-
-            fn end(self) -> Result<()> {
-                self.end_struct()
-            }
-        }
-
-        impl<'ser, 'sig, 'b, W> ser::$trait for StructSeqSerializer<'ser, 'sig, 'b, W>
-        where
-            W: Write + Seek,
-        {
-            type Ok = ();
-            type Error = Error;
-
-            fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<()>
-            where
-                T: ?Sized + Serialize,
-            {
-                match self {
-                    StructSeqSerializer::Struct(ser) => ser.serialize_field(key, value),
-                    StructSeqSerializer::Seq(ser) => ser.serialize_element(value),
-                }
-            }
-
-            fn end(self) -> Result<()> {
-                match self {
-                    StructSeqSerializer::Struct(ser) => ser.end_struct(),
-                    StructSeqSerializer::Seq(ser) => ser.end_seq(),
-                }
-            }
-        }
-    };
-}
-serialize_struct_named_fields!(SerializeStruct);
-serialize_struct_named_fields!(SerializeStructVariant);
