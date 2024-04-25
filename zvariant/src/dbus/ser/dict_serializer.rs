@@ -36,37 +36,6 @@ where
             first_padding,
         }
     }
-
-    pub(super) fn end_seq(self) -> Result<()> {
-        self.ser
-            .0
-            .sig_parser
-            .skip_chars(self.element_signature_len)?;
-
-        // Set size of array in bytes
-        let array_len = self.ser.0.bytes_written - self.start;
-        let len = usize_to_u32(array_len);
-        let total_array_len = (array_len + self.first_padding + 4) as i64;
-        self.ser
-            .0
-            .writer
-            .seek(std::io::SeekFrom::Current(-total_array_len))
-            .map_err(|e| Error::InputOutput(e.into()))?;
-        self.ser
-            .0
-            .writer
-            .write_u32(self.ser.0.ctxt.endian(), len)
-            .map_err(|e| Error::InputOutput(e.into()))?;
-        self.ser
-            .0
-            .writer
-            .seek(std::io::SeekFrom::Current(total_array_len - 4))
-            .map_err(|e| Error::InputOutput(e.into()))?;
-
-        self.ser.0.container_depths = self.ser.0.container_depths.dec_array();
-
-        Ok(())
-    }
 }
 
 impl<'ser, 'sig, 'b, W> SerializeMap for DictSerializer<'ser, 'sig, 'b, W>
@@ -116,6 +85,33 @@ where
     }
 
     fn end(self) -> Result<()> {
-        self.end_seq()
+        self.ser
+            .0
+            .sig_parser
+            .skip_chars(self.element_signature_len)?;
+
+        // Set size of array in bytes
+        let array_len = self.ser.0.bytes_written - self.start;
+        let len = usize_to_u32(array_len);
+        let total_array_len = (array_len + self.first_padding + 4) as i64;
+        self.ser
+            .0
+            .writer
+            .seek(std::io::SeekFrom::Current(-total_array_len))
+            .map_err(|e| Error::InputOutput(e.into()))?;
+        self.ser
+            .0
+            .writer
+            .write_u32(self.ser.0.ctxt.endian(), len)
+            .map_err(|e| Error::InputOutput(e.into()))?;
+        self.ser
+            .0
+            .writer
+            .seek(std::io::SeekFrom::Current(total_array_len - 4))
+            .map_err(|e| Error::InputOutput(e.into()))?;
+
+        self.ser.0.container_depths = self.ser.0.container_depths.dec_array();
+
+        Ok(())
     }
 }

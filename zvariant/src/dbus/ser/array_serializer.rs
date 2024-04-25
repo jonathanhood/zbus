@@ -32,8 +32,31 @@ where
             first_padding,
         }
     }
+}
 
-    pub(super) fn end_seq(self) -> Result<()> {
+impl<'ser, 'sig, 'b, W> ser::SerializeSeq for ArraySerializer<'ser, 'sig, 'b, W>
+where
+    W: Write + Seek,
+{
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        // We want to keep parsing the same signature repeatedly for each element so we use a
+        // disposable clone.
+        let sig_parser = self.ser.0.sig_parser.clone();
+        self.ser.0.sig_parser = sig_parser.clone();
+
+        value.serialize(&mut *self.ser)?;
+        self.ser.0.sig_parser = sig_parser;
+
+        Ok(())
+    }
+
+    fn end(self) -> Result<()> {
         self.ser
             .0
             .sig_parser
@@ -62,32 +85,5 @@ where
         self.ser.0.container_depths = self.ser.0.container_depths.dec_array();
 
         Ok(())
-    }
-}
-
-impl<'ser, 'sig, 'b, W> ser::SerializeSeq for ArraySerializer<'ser, 'sig, 'b, W>
-where
-    W: Write + Seek,
-{
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
-    where
-        T: ?Sized + Serialize,
-    {
-        // We want to keep parsing the same signature repeatedly for each element so we use a
-        // disposable clone.
-        let sig_parser = self.ser.0.sig_parser.clone();
-        self.ser.0.sig_parser = sig_parser.clone();
-
-        value.serialize(&mut *self.ser)?;
-        self.ser.0.sig_parser = sig_parser;
-
-        Ok(())
-    }
-
-    fn end(self) -> Result<()> {
-        self.end_seq()
     }
 }

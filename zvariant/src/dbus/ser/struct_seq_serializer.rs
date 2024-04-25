@@ -1,6 +1,13 @@
-use super::{array_serializer::ArraySerializer, struct_serializer::StructSerializer};
+use super::{
+    array_serializer::ArraySerializer, dict_serializer::DictSerializer,
+    struct_serializer::StructSerializer,
+};
 use crate::{Error, Result};
-use serde::{ser, ser::SerializeSeq, Serialize};
+use serde::{
+    ser,
+    ser::{SerializeMap, SerializeSeq},
+    Serialize,
+};
 use std::{
     io::{Seek, Write},
     str,
@@ -11,6 +18,7 @@ use std::{
 pub enum StructSeqSerializer<'ser, 'sig, 'b, W> {
     Struct(StructSerializer<'ser, 'sig, 'b, W>),
     Seq(ArraySerializer<'ser, 'sig, 'b, W>),
+    Dict(DictSerializer<'ser, 'sig, 'b, W>),
 }
 
 macro_rules! serialize_struct_anon_fields {
@@ -29,13 +37,19 @@ macro_rules! serialize_struct_anon_fields {
                 match self {
                     StructSeqSerializer::Struct(ser) => ser.$method(value),
                     StructSeqSerializer::Seq(ser) => ser.serialize_element(value),
+                    StructSeqSerializer::Dict(_ser) => {
+                        unreachable!("Dictionaries don't support anonymous fields")
+                    }
                 }
             }
 
             fn end(self) -> Result<()> {
                 match self {
                     StructSeqSerializer::Struct(ser) => ser.end_struct(),
-                    StructSeqSerializer::Seq(ser) => ser.end_seq(),
+                    StructSeqSerializer::Seq(ser) => ser.end(),
+                    StructSeqSerializer::Dict(_ser) => {
+                        unreachable!("Dictionaries don't support anonymous fields")
+                    }
                 }
             }
         }
@@ -58,13 +72,18 @@ macro_rules! serialize_struct_named_fields {
                 match self {
                     StructSeqSerializer::Struct(ser) => ser.serialize_field(key, value),
                     StructSeqSerializer::Seq(ser) => ser.serialize_element(value),
+                    StructSeqSerializer::Dict(ser) => {
+                        ser.serialize_key(key)?;
+                        ser.serialize_value(value)
+                    }
                 }
             }
 
             fn end(self) -> Result<()> {
                 match self {
                     StructSeqSerializer::Struct(ser) => ser.end_struct(),
-                    StructSeqSerializer::Seq(ser) => ser.end_seq(),
+                    StructSeqSerializer::Seq(ser) => ser.end(),
+                    StructSeqSerializer::Dict(ser) => ser.end(),
                 }
             }
         }

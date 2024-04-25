@@ -2096,4 +2096,173 @@ mod tests {
         // * Test deserializers.
         // * Test gvariant format.
     }
+
+    #[test]
+    fn structs() {
+        #[derive(Serialize, Deserialize, Type)]
+        #[zvariant(signature = "a{sv}")]
+        struct MyData {
+            a: i32,
+            b: String,
+        }
+
+        let context = Context::new_dbus(endi::Endian::Little, 0);
+        let input = MyData {
+            a: 42,
+            b: "hello".to_string(),
+        };
+
+        let encoded = to_bytes(context, &input);
+        assert!(
+            encoded.is_ok(),
+            "Failed to encode struct: {:?}",
+            encoded.err()
+        );
+        let encoded = encoded.unwrap();
+
+        let decoded: Result<(MyData, usize)> = encoded.deserialize();
+        assert!(
+            decoded.is_ok(),
+            "Failed to decode struct: {:?}",
+            decoded.err()
+        );
+        let (output, decoded_bytes) = decoded.unwrap();
+
+        assert_eq!(output.a, 42);
+        assert_eq!(output.b, "hello");
+        assert_eq!(decoded_bytes, encoded.len());
+    }
+
+    #[test]
+    fn nested_structs() {
+        #[derive(Serialize, Deserialize, Type)]
+        #[zvariant(signature = "a{sv}")]
+        struct InnerData {
+            a: i32,
+            b: String,
+        }
+
+        #[derive(Serialize, Deserialize, Type)]
+        #[zvariant(signature = "a{sa{sv}}")]
+        struct OuterData {
+            inner: InnerData,
+        }
+
+        let context = Context::new_dbus(endi::Endian::Little, 0);
+        let input = OuterData {
+            inner: InnerData {
+                a: 42,
+                b: "hello".to_string(),
+            },
+        };
+
+        let encoded = to_bytes(context, &input);
+        assert!(
+            encoded.is_ok(),
+            "Failed to encode struct: {:?}",
+            encoded.err()
+        );
+        let encoded = encoded.unwrap();
+
+        let decoded: Result<(OuterData, usize)> = encoded.deserialize();
+        assert!(
+            decoded.is_ok(),
+            "Failed to decode struct: {:?}",
+            decoded.err()
+        );
+        let (output, decoded_bytes) = decoded.unwrap();
+
+        assert_eq!(output.inner.a, 42);
+        assert_eq!(output.inner.b, "hello");
+        assert_eq!(decoded_bytes, encoded.len());
+    }
+
+    #[test]
+    fn sequence_of_structs() {
+        #[derive(Serialize, Deserialize, Type)]
+        #[zvariant(signature = "a{sv}")]
+        struct Data {
+            a: i32,
+            b: String,
+        }
+
+        let context = Context::new_dbus(endi::Endian::Little, 0);
+        let input = vec![
+            Data {
+                a: 42,
+                b: "hello".to_string(),
+            },
+            Data {
+                a: 43,
+                b: "world".to_string(),
+            },
+        ];
+
+        let encoded = to_bytes(context, &input);
+        assert!(
+            encoded.is_ok(),
+            "Failed to encode struct: {:?}",
+            encoded.err()
+        );
+        let encoded = encoded.unwrap();
+
+        let decoded: Result<(Vec<Data>, usize)> = encoded.deserialize();
+        assert!(
+            decoded.is_ok(),
+            "Failed to decode struct: {:?}",
+            decoded.err()
+        );
+        let (output, decoded_bytes) = decoded.unwrap();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].a, 42);
+        assert_eq!(output[0].b, "hello");
+        assert_eq!(output[1].a, 43);
+        assert_eq!(output[1].b, "world");
+        assert_eq!(decoded_bytes, encoded.len());
+    }
+
+    #[test]
+    fn tuple_of_structs() {
+        #[derive(Serialize, Deserialize, Type)]
+        #[zvariant(signature = "a{sv}")]
+        struct Data {
+            a: i32,
+            b: String,
+        }
+
+        let context = Context::new_dbus(endi::Endian::Little, 0);
+        let input = (
+            Data {
+                a: 42,
+                b: "hello".to_string(),
+            },
+            Data {
+                a: 43,
+                b: "world".to_string(),
+            },
+        );
+
+        let encoded = to_bytes(context, &input);
+        assert!(
+            encoded.is_ok(),
+            "Failed to encode struct: {:?}",
+            encoded.err()
+        );
+        let encoded = encoded.unwrap();
+
+        let decoded: Result<((Data, Data), usize)> = encoded.deserialize();
+        assert!(
+            decoded.is_ok(),
+            "Failed to decode struct: {:?}",
+            decoded.err()
+        );
+        let ((output_first, output_second), decoded_bytes) = decoded.unwrap();
+
+        assert_eq!(output_first.a, 42);
+        assert_eq!(output_first.b, "hello");
+        assert_eq!(output_second.a, 43);
+        assert_eq!(output_second.b, "world");
+        assert_eq!(decoded_bytes, encoded.len());
+    }
 }

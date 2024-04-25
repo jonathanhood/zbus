@@ -362,7 +362,19 @@ where
             VARIANT_SIGNATURE_CHAR => {
                 StructSerializer::variant(self).map(StructSeqSerializer::Struct)
             }
-            ARRAY_SIGNATURE_CHAR => self.serialize_seq(Some(len)).map(StructSeqSerializer::Seq),
+            ARRAY_SIGNATURE_CHAR => {
+                // Peek ahead to decide if this an array of elements
+                // or an array of k/v pair DictEntries
+                let mut sig_parser = self.0.sig_parser.clone();
+                sig_parser.skip_char()?;
+                let array_type = sig_parser.next_char()?;
+
+                if array_type == DICT_ENTRY_SIG_START_CHAR {
+                    self.serialize_map(Some(len)).map(StructSeqSerializer::Dict)
+                } else {
+                    self.serialize_seq(Some(len)).map(StructSeqSerializer::Seq)
+                }
+            }
             _ => StructSerializer::structure(self).map(StructSeqSerializer::Struct),
         }
     }
