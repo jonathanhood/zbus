@@ -1,11 +1,11 @@
 use core::fmt::{self, Debug, Display, Formatter};
-use serde::de::{Deserialize, Deserializer};
+use serde::{de::{Deserialize, Deserializer}, Serialize};
 use static_assertions::assert_impl_all;
 
 use crate::{Error, Result, Signature, Type};
 
 /// [`Signature`] that identifies a complete type.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
 pub struct CompleteType<'a>(Signature<'a>);
 
 assert_impl_all!(CompleteType<'_>: Send, Sync, Unpin);
@@ -42,5 +42,13 @@ impl<'de: 'a, 'a> Deserialize<'de> for CompleteType<'a> {
         let val = Signature::deserialize(deserializer)?;
 
         Self::try_from(val).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'a> Serialize for CompleteType<'a> {
+    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        serializer.serialize_str(self.0.as_str())
     }
 }

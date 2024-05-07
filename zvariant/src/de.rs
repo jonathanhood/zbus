@@ -32,6 +32,8 @@ pub(crate) struct DeserializerCommon<'de, 'sig, 'f, F> {
     pub(crate) sig_parser: SignatureParser<'sig>,
 
     pub(crate) container_depths: ContainerDepths,
+
+    pub(crate) last_parsed_signature: Option<Signature<'static>>,
 }
 
 /// Our deserialization implementation.

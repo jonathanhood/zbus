@@ -564,7 +564,7 @@ impl<'a> Serialize for Value<'a> {
         let mut structure = serializer.serialize_struct("zvariant::Value", 2)?;
 
         let signature = self.value_signature();
-        structure.serialize_field("zvariant::Value::Signature", &signature)?;
+        structure.serialize_field("zvariant::Value::Signature", signature.as_str())?;
 
         self.serialize_value_as_struct_field("zvariant::Value::Value", &mut structure)?;
 
@@ -618,11 +618,11 @@ impl<'de> Visitor<'de> for ValueVisitor {
         V: MapAccess<'de>,
     {
         let (_, signature) = visitor
-            .next_entry::<&str, Signature<'_>>()?
+            .next_entry::<String, Signature<'_>>()?
             .ok_or_else(|| {
                 Error::invalid_value(Unexpected::Other("nothing"), &"a Value signature")
             })?;
-        let _ = visitor.next_key::<&str>()?;
+        let _ = visitor.next_key::<String>()?;
 
         let seed = ValueSeed::<Value<'_>> {
             signature,
@@ -814,6 +814,13 @@ where
         E: serde::de::Error,
     {
         self.visit_string(String::from(value))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value<'de>, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Str(Str::from(value)))
     }
 
     value_seed_str_method!(visit_borrowed_str, &'de str, from_str_unchecked);
@@ -1144,5 +1151,26 @@ mod tests {
                 s,
             );
         }
+    }
+
+    #[test]
+    fn value_boxed_encoding() {
+        // Using serde-json to clearly show the boxed encoding
+        // and assert how it behaves
+
+        let input = Value::Str(Str::from("Hello World"));
+        let json = serde_json::to_value(&input).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "zvariant::Value::Signature": "s",
+                "zvariant::Value::Value":  "Hello World"
+            })
+        );
+
+        let output: OwnedValue = serde_json::from_value(json).unwrap();
+        let output: String = output.try_into().unwrap();
+        assert_eq!(output, "Hello World");
     }
 }

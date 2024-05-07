@@ -149,9 +149,12 @@ where
                 &"D-Bus string type must not contain interior null bytes",
             ));
         }
+
         let c = self.0.sig_parser.next_char()?;
+
         if c == VARIANT_SIGNATURE_CHAR {
-            self.0.value_sign = Some(signature_string!(v));
+            let value = Value::from(v);
+            return value.serialize(self);
         }
 
         match c {
@@ -161,7 +164,10 @@ where
                     .write_u32(self.0.ctxt.endian(), usize_to_u32(v.len()))
                     .map_err(|e| Error::InputOutput(e.into()))?;
             }
-            Signature::SIGNATURE_CHAR | VARIANT_SIGNATURE_CHAR => {
+            Signature::SIGNATURE_CHAR => {
+                let signature = signature_string!(v);
+                self.0.value_sign = Some(signature);
+
                 self.0
                     .write_u8(self.0.ctxt.endian(), usize_to_u8(v.len()))
                     .map_err(|e| Error::InputOutput(e.into()))?;
@@ -344,6 +350,12 @@ where
             VARIANT_SIGNATURE_CHAR => {
                 StructSerializer::variant(self).map(StructSeqSerializer::Struct)
             }
+            ObjectPath::SIGNATURE_CHAR => {
+                StructSerializer::object_path(self).map(StructSeqSerializer::Struct)
+            }
+            Signature::SIGNATURE_CHAR => {
+                StructSerializer::signature(self).map(StructSeqSerializer::Struct)
+            }
             ARRAY_SIGNATURE_CHAR => self.serialize_seq(Some(len)).map(StructSeqSerializer::Seq),
             _ => StructSerializer::structure(self).map(StructSeqSerializer::Struct),
         }
@@ -466,6 +478,30 @@ where
         })
     }
 
+    fn object_path(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
+        ser.0.add_padding(ObjectPath::alignment(Format::DBus))?;
+
+        let container_depths = ser.0.container_depths;
+
+        Ok(Self {
+            ser,
+            end_parens: 0,
+            container_depths,
+        })
+    }
+
+    fn signature(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
+        ser.0.add_padding(Signature::alignment(Format::DBus))?;
+
+        let container_depths = ser.0.container_depths;
+
+        Ok(Self {
+            ser,
+            end_parens: 0,
+            container_depths,
+        })
+    }
+
     fn structure(ser: &'b mut Serializer<'ser, 'sig, W>) -> Result<Self> {
         let c = ser.0.sig_parser.next_char()?;
         if c != STRUCT_SIG_START_CHAR && c != DICT_ENTRY_SIG_START_CHAR {
@@ -516,6 +552,45 @@ where
         T: ?Sized + Serialize,
     {
         match name {
+            Some("zvariant::ObjectPath::Value") => {
+                if self.ser.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+                    self.serialize_struct_element(Some("zvariant::Value::Signature"), "o")?;
+                    self.serialize_struct_element(Some("zvariant::Value::Value"), value)
+                } else {
+                    value.serialize(&mut *self.ser)
+                }
+            }
+
+            Some("zvariant::Signature::Value") => {
+                if self.ser.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+                    self.serialize_struct_element(Some("zvariant::Value::Signature"), "g")?;
+                    self.serialize_struct_element(Some("zvariant::Value::Value"), value)
+                } else {
+                    value.serialize(&mut *self.ser)
+                }
+            }
+
+            Some("zvariant::Value::Signature") => {
+                let signature = Signature::try_from("g").unwrap();
+                let sig_parser = SignatureParser::new(signature);
+
+                let mut ser = Serializer(crate::SerializerCommon::<W> {
+                    ctxt: self.ser.0.ctxt,
+                    sig_parser,
+                    writer: self.ser.0.writer,
+                    #[cfg(unix)]
+                    fds: self.ser.0.fds,
+                    bytes_written: self.ser.0.bytes_written,
+                    value_sign: None,
+                    container_depths: self.ser.0.container_depths,
+                });
+
+                let result = value.serialize(&mut ser);
+                self.ser.0.value_sign = ser.0.value_sign;
+                self.ser.0.bytes_written = ser.0.bytes_written;
+                result
+            }
+
             Some("zvariant::Value::Value") => {
                 // Serializing the value of a Value, which means signature was serialized
                 // already, and also put aside for us to be picked here.
@@ -540,6 +615,7 @@ where
                 });
                 value.serialize(&mut ser)?;
                 self.ser.0.bytes_written = ser.0.bytes_written;
+                self.ser.0.sig_parser.skip_char()?;
 
                 Ok(())
             }
@@ -944,5 +1020,152 @@ mod test {
         assert_eq!(raw_bytes[13], 0x00, "The f64 value should be encoded");
         assert_eq!(raw_bytes[14], 0x08, "The f64 value should be encoded");
         assert_eq!(raw_bytes[15], 0x40, "The f64 value should be encoded");
+    }
+
+    #[test]
+    fn string_variant() {
+        let input: &str = "Hello World";
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 's' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0, "Pad to a 4-byte boundary");
+        assert_eq!(raw_bytes[4], 11, "The string length should be encoded");
+        assert_eq!(raw_bytes[5], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[6], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[7], 0, "The string length should be encoded");
+        assert_eq!(
+            &raw_bytes[8..(raw_bytes.len() - 1)],
+            input.as_bytes(),
+            "The string value should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[raw_bytes.len() - 1],
+            0,
+            "The string value should be null terminated"
+        );
+    }
+
+    #[test]
+    fn object_path() {
+        let input = ObjectPath::try_from("/hello/world").unwrap();
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "o", &input).unwrap();
+        let raw_bytes: &[u8] = &data.bytes();
+
+        assert_eq!(raw_bytes[0], 12, "The string length should be encoded");
+        assert_eq!(raw_bytes[1], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[2], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[3], 0, "The string length should be encoded");
+        assert_eq!(
+            &raw_bytes[4..(raw_bytes.len() - 1)],
+            input.as_bytes(),
+            "The string value should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[raw_bytes.len() - 1],
+            0,
+            "The string value should be null terminated"
+        );
+    }
+
+    #[test]
+    fn object_path_variant() {
+        let input = ObjectPath::try_from("/hello/world").unwrap();
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'o' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0, "Pad to a 4-byte boundary");
+        assert_eq!(raw_bytes[4], 12, "The string length should be encoded");
+        assert_eq!(raw_bytes[5], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[6], 0, "The string length should be encoded");
+        assert_eq!(raw_bytes[7], 0, "The string length should be encoded");
+        assert_eq!(
+            &raw_bytes[8..(raw_bytes.len() - 1)],
+            input.as_bytes(),
+            "The string value should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[raw_bytes.len() - 1],
+            0,
+            "The string value should be null terminated"
+        );
+    }
+
+    #[test]
+    fn signature() {
+        let input = Signature::try_from("a(sv)").unwrap();
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "g", &input).unwrap();
+        let raw_bytes: &[u8] = &data.bytes();
+
+        assert_eq!(raw_bytes[0], 5, "The signature length should be encoded");
+        assert_eq!(
+            &raw_bytes[1..(raw_bytes.len() - 1)],
+            input.as_bytes(),
+            "The signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[raw_bytes.len() - 1],
+            0,
+            "The signature should be null terminated"
+        );
+    }
+
+    #[test]
+    fn signature_variant() {
+        let input = Signature::try_from("a(sv)").unwrap();
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'g' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 5, "The signature length should be encoded");
+        assert_eq!(
+            &raw_bytes[4..(raw_bytes.len() - 1)],
+            input.as_bytes(),
+            "The signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[raw_bytes.len() - 1],
+            0,
+            "The signature should be null terminated"
+        );
     }
 }

@@ -51,6 +51,7 @@ impl<'de, 'sig, 'f, F> Deserializer<'de, 'sig, 'f, F> {
             fds: PhantomData,
             pos: 0,
             container_depths: Default::default(),
+            last_parsed_signature: None,
         }))
     }
 }
@@ -225,8 +226,26 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
     where
         V: Visitor<'de>,
     {
+        let next_char = self.0.sig_parser.next_char()?;
+
+        if next_char == VARIANT_SIGNATURE_CHAR {
+            let value: Value<'de> = serde::Deserialize::deserialize(&mut *self)?;
+
+            match value {
+                Value::Str(value) => return visitor.visit_str(value.as_str()),
+                Value::ObjectPath(value) => return visitor.visit_str(value.as_str()),
+                Value::Signature(value) => return visitor.visit_str(value.as_str()),
+                _ => {
+                    return Err(de::Error::invalid_type(
+                        de::Unexpected::Str(&value.to_string()),
+                        &"string, object path, or signature",
+                    ))
+                }
+            }
+        }
+
         let len = match self.0.sig_parser.next_char()? {
-            Signature::SIGNATURE_CHAR | VARIANT_SIGNATURE_CHAR => {
+            Signature::SIGNATURE_CHAR => {
                 let len_slice = self.0.next_slice(1)?;
 
                 len_slice[0] as usize
@@ -261,6 +280,12 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
         }
         self.0.pos += 1; // skip trailing null byte
         let s = str::from_utf8(slice).map_err(Error::Utf8)?;
+
+        if next_char == Signature::SIGNATURE_CHAR {
+            let signature = Signature::try_from(s)?.into_owned();
+            self.0.last_parsed_signature = Some(signature);
+        }
+
         self.0.sig_parser.skip_char()?;
 
         visitor.visit_borrowed_str(s)
@@ -325,7 +350,6 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
         match self.0.sig_parser.next_char()? {
             VARIANT_SIGNATURE_CHAR => {
                 let value_de = ValueDeserializer::new(self);
-
                 visitor.visit_seq(value_de)
             }
             ARRAY_SIGNATURE_CHAR => {
@@ -477,6 +501,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
+            last_parsed_signature: None,
         });
         let v = seed.deserialize(&mut de);
         self.de.0.pos += de.0.pos;
@@ -605,18 +630,15 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
 struct ValueDeserializer<'d, 'de, 'sig, 'f, F> {
     de: &'d mut Deserializer<'de, 'sig, 'f, F>,
     stage: ValueParseStage,
-    sig_start: usize,
 }
 
 impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>
     ValueDeserializer<'d, 'de, 'sig, 'f, F>
 {
     fn new(de: &'d mut Deserializer<'de, 'sig, 'f, F>) -> Self {
-        let sig_start = de.0.pos;
         ValueDeserializer::<F> {
             de,
             stage: ValueParseStage::Signature,
-            sig_start,
         }
     }
 }
@@ -634,38 +656,61 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
             ValueParseStage::Signature => {
                 self.stage = ValueParseStage::Value;
 
-                seed.deserialize(&mut *self.de).map(Some)
+                let signature = signature_string!("g");
+                let sig_parser = SignatureParser::new(signature);
+
+                let context = Context::new_dbus(
+                    self.de.0.ctxt.endian(),
+                    self.de.0.ctxt.position() + self.de.0.pos,
+                );
+
+                let mut de = Deserializer::<F>(DeserializerCommon {
+                    ctxt: context,
+                    sig_parser,
+                    bytes: subslice(self.de.0.bytes, self.de.0.pos..)?,
+                    fds: self.de.0.fds,
+                    pos: 0,
+                    container_depths: self.de.0.container_depths,
+                    last_parsed_signature: None,
+                });
+
+                let result = seed.deserialize(&mut de);
+                self.de.0.pos += de.0.pos;
+                self.de.0.last_parsed_signature = de.0.last_parsed_signature;
+
+                result.map(Some)
             }
             ValueParseStage::Value => {
                 self.stage = ValueParseStage::Done;
 
-                let sig_len = self.de.0.bytes[self.sig_start] as usize;
-                // skip length byte
-                let sig_start = self.sig_start + 1;
-                let sig_end = sig_start + sig_len;
-                // Skip trailing nul byte
-                let value_start = sig_end + 1;
+                if self.de.0.last_parsed_signature.is_none() {
+                    return Err(serde::de::Error::custom(
+                        "ValueDeserializer: Signature not parsed",
+                    ));
+                }
 
-                let slice = subslice(self.de.0.bytes, sig_start..sig_end)?;
-                let signature = Signature::try_from(slice)?;
+                let signature = self.de.0.last_parsed_signature.take().unwrap();
                 let sig_parser = SignatureParser::new(signature);
 
                 let ctxt = Context::new(
                     Format::DBus,
                     self.de.0.ctxt.endian(),
-                    self.de.0.ctxt.position() + value_start,
+                    self.de.0.ctxt.position() + self.de.0.pos,
                 );
+
                 let mut de = Deserializer::<F>(DeserializerCommon {
                     ctxt,
                     sig_parser,
-                    bytes: subslice(self.de.0.bytes, value_start..)?,
+                    bytes: subslice(self.de.0.bytes, self.de.0.pos..)?,
                     fds: self.de.0.fds,
                     pos: 0,
                     container_depths: self.de.0.container_depths.inc_variant()?,
+                    last_parsed_signature: None,
                 });
 
                 let v = seed.deserialize(&mut de).map(Some);
                 self.de.0.pos += de.0.pos;
+                self.de.0.sig_parser.skip_char()?;
 
                 v
             }
@@ -691,7 +736,7 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> EnumAccess<'d
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::serialized::Data;
+    use crate::{serialized::Data, OwnedObjectPath};
     use endi::LE;
 
     #[test]
@@ -811,5 +856,54 @@ mod test {
 
         let v: f64 = data.deserialize_for_signature("v").unwrap().0;
         assert_eq!(v, 3.0f64);
+    }
+
+    #[test]
+    pub fn deserialize_variant_string() {
+        let bytes = [
+            0x01, 's' as u8, 0, // Signature
+            0, // Pad to a 4-byte boundary
+            0x05, 0x00, 0x00, 0x00, // Length
+            b'h', b'e', b'l', b'l', b'o', // Value
+            0,    // Null terminator
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: String = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, "hello");
+    }
+
+    #[test]
+    pub fn deserialize_variant_object_path() {
+        let bytes = [
+            0x01, 'o' as u8, 0, // Signature
+            0, // Pad to a 4-byte boundary
+            0x04, 0x00, 0x00, 0x00, // Length
+            b'/', b'o', b'r', b'g', // Object Path
+            0,    // Null terminator
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: OwnedObjectPath = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v.as_str(), "/org");
+    }
+
+    #[test]
+    pub fn deserialize_variant_signature() {
+        let bytes = [
+            0x01, 'g' as u8, 0, // Signature
+            0x04, b'a', b'(', b'v', b')', // Signature
+            0,    // Null terminator
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: Signature<'_> = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v.as_str(), "a(v)");
     }
 }

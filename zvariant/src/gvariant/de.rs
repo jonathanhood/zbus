@@ -50,6 +50,7 @@ impl<'de, 'sig, 'f, F> Deserializer<'de, 'sig, 'f, F> {
             fds: PhantomData,
             pos: 0,
             container_depths: Default::default(),
+            last_parsed_signature: None,
         }))
     }
 }
@@ -69,6 +70,7 @@ macro_rules! deserialize_basic {
                 fds: self.0.fds,
                 pos: 0,
                 container_depths: self.0.container_depths,
+                last_parsed_signature: None,
             });
 
             let v = dbus_de.$method(visitor)?;
@@ -542,6 +544,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
+            last_parsed_signature: None,
         });
 
         let v = seed.deserialize(&mut de).map(Some);
@@ -608,6 +611,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> MapAccess<'de
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
+            last_parsed_signature: None,
         });
         let v = seed.deserialize(&mut de).map(Some);
         self.de.0.pos += de.0.pos;
@@ -648,6 +652,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> MapAccess<'de
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
+            last_parsed_signature: None,
         });
         let v = seed.deserialize(&mut de);
         self.de.0.pos += de.0.pos;
@@ -732,6 +737,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
+            last_parsed_signature: None,
         });
         let v = seed.deserialize(&mut de).map(Some);
         self.de.0.pos += de.0.pos;
@@ -829,6 +835,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
                     fds: self.de.0.fds,
                     pos: 0,
                     container_depths: self.de.0.container_depths,
+                    last_parsed_signature: None,
                 });
 
                 seed.deserialize(&mut de).map(Some)
@@ -853,6 +860,7 @@ impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de
                     fds: self.de.0.fds,
                     pos: 0,
                     container_depths: self.de.0.container_depths.inc_variant()?,
+                    last_parsed_signature: None,
                 });
 
                 let v = seed.deserialize(&mut de).map(Some);

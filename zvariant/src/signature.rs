@@ -5,8 +5,8 @@ use core::{
     str,
 };
 use serde::{
-    de::{Deserialize, Deserializer},
-    ser::{Serialize, Serializer},
+    de::{Deserialize, Deserializer, MapAccess, Visitor},
+    ser::{Serialize, SerializeStruct, Serializer},
 };
 use static_assertions::assert_impl_all;
 use std::{
@@ -490,7 +490,11 @@ impl<'a> Serialize for Signature<'a> {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        // Box the signature to indicate that it's more than
+        // just a string
+        let mut structure = serializer.serialize_struct("zvariant::Signature", 1)?;
+        structure.serialize_field("zvariant::Signature::Value", self.as_str())?;
+        structure.end()
     }
 }
 
@@ -499,9 +503,53 @@ impl<'de: 'a, 'a> Deserialize<'de> for Signature<'a> {
     where
         D: Deserializer<'de>,
     {
-        let val = <std::borrow::Cow<'a, str>>::deserialize(deserializer)?;
+        deserializer.deserialize_any(SignatureVisitor)
+    }
+}
 
-        Self::try_from(val).map_err(serde::de::Error::custom)
+struct SignatureVisitor;
+
+impl<'de> Visitor<'de> for SignatureVisitor {
+    type Value = Signature<'de>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a valid signature string or boxed representation")
+    }
+
+    fn visit_string<E>(self, value: String) -> core::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Signature::try_from(value).map_err(serde::de::Error::custom)
+    }
+
+    fn visit_str<E>(self, value: &str) -> core::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> core::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Signature::try_from(value).map_err(serde::de::Error::custom)
+    }
+
+    fn visit_map<M>(self, mut access: M) -> core::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while let Some((key, value)) = access.next_entry::<String, String>()? {
+            if key == "zvariant::Signature::Value" {
+                return Signature::try_from(value).map_err(serde::de::Error::custom);
+            }
+        }
+
+        Err(serde::de::Error::missing_field(
+            "zvariant::Signature::Value",
+        ))
     }
 }
 
@@ -565,9 +613,8 @@ impl<'de> Deserialize<'de> for OwnedSignature {
     where
         D: Deserializer<'de>,
     {
-        let val = String::deserialize(deserializer)?;
-
-        OwnedSignature::try_from(val).map_err(serde::de::Error::custom)
+        let sig: Signature<'_> = Signature::deserialize(deserializer)?;
+        Ok(sig.into_owned().into())
     }
 }
 
@@ -579,6 +626,8 @@ impl std::fmt::Display for OwnedSignature {
 
 #[cfg(test)]
 mod tests {
+    use crate::OwnedSignature;
+
     use super::{Bytes, Signature};
     use std::sync::Arc;
 
@@ -635,5 +684,24 @@ mod tests {
         let sig_a = Signature::from_str_unchecked("(so)i");
         let sig_b = Signature::from_str_unchecked("(so)u");
         assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn signature_boxed_encoding() {
+        // Using serde-json to clearly show the boxed encoding
+        // and assert how it behaves
+
+        let input = Signature::from_static_str_unchecked("a(sv)");
+        let json = serde_json::to_value(&input).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "zvariant::Signature::Value": "a(sv)",
+            })
+        );
+
+        let output: OwnedSignature = serde_json::from_value(json).unwrap();
+        assert_eq!(output.as_str(), "a(sv)");
     }
 }

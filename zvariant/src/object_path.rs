@@ -1,7 +1,7 @@
 use core::{fmt::Debug, str};
 use serde::{
-    de::{self, Deserialize, Deserializer, Visitor},
-    ser::{Serialize, Serializer},
+    de::{Deserialize, Deserializer, Visitor},
+    ser::{Serialize, SerializeStruct, Serializer},
 };
 use static_assertions::assert_impl_all;
 use std::borrow::Cow;
@@ -223,7 +223,11 @@ impl<'a> Serialize for ObjectPath<'a> {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        // Box the object path to indicate that it's more than
+        // just a string
+        let mut structure = serializer.serialize_struct("zvariant::ObjectPath", 1)?;
+        structure.serialize_field("zvariant::ObjectPath::Value", self.as_str())?;
+        structure.end()
     }
 }
 
@@ -249,6 +253,22 @@ impl<'de> Visitor<'de> for ObjectPathVisitor {
 
     #[inline]
     fn visit_borrowed_str<E>(self, value: &'de str) -> core::result::Result<ObjectPath<'de>, E>
+    where
+        E: serde::de::Error,
+    {
+        ObjectPath::try_from(value).map_err(serde::de::Error::custom)
+    }
+
+    #[inline]
+    fn visit_str<E>(self, value: &str) -> core::result::Result<ObjectPath<'de>, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    #[inline]
+    fn visit_string<E>(self, value: String) -> core::result::Result<ObjectPath<'de>, E>
     where
         E: serde::de::Error,
     {
@@ -374,9 +394,8 @@ impl<'de> Deserialize<'de> for OwnedObjectPath {
     where
         D: Deserializer<'de>,
     {
-        String::deserialize(deserializer)
-            .and_then(|s| ObjectPath::try_from(s).map_err(|e| de::Error::custom(e.to_string())))
-            .map(Self)
+        let object_path: ObjectPath<'de> = ObjectPath::deserialize(deserializer)?;
+        Ok(OwnedObjectPath::from(object_path))
     }
 }
 
