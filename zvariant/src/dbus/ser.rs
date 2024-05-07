@@ -10,7 +10,7 @@ use crate::{
     serialized::{Context, Format},
     signature_parser::SignatureParser,
     utils::*,
-    Basic, Error, ObjectPath, Result, Signature, WriteBytes,
+    Basic, Error, ObjectPath, Result, Signature, Value, WriteBytes,
 };
 
 #[cfg(unix)]
@@ -61,8 +61,13 @@ macro_rules! serialize_basic {
     };
     ($method:ident($type:ty) $write_method:ident($as:ty)) => {
         fn $method(self, v: $type) -> Result<()> {
-            self.0.prep_serialize_basic::<$type>()?;
-            self.0.$write_method(self.0.ctxt.endian(), v as $as).map_err(|e| Error::InputOutput(e.into()))
+            if self.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+                let value = Value::from(v);
+                value.serialize(self)
+            } else {
+                self.0.prep_serialize_basic::<$type>()?;
+                self.0.$write_method(self.0.ctxt.endian(), v as $as).map_err(|e| Error::InputOutput(e.into()))
+            }
         }
     };
 }
@@ -99,6 +104,10 @@ where
                     .write_u32(self.0.ctxt.endian(), idx)
                     .map_err(|e| Error::InputOutput(e.into()))
             }
+            VARIANT_SIGNATURE_CHAR => {
+                let value = Value::I32(v);
+                value.serialize(self)
+            }
             _ => {
                 self.0.prep_serialize_basic::<i32>()?;
                 self.0
@@ -109,11 +118,16 @@ where
     }
 
     fn serialize_u8(self, v: u8) -> Result<()> {
-        self.0.prep_serialize_basic::<u8>()?;
-        // Endianness is irrelevant for single bytes.
-        self.0
-            .write_u8(self.0.ctxt.endian(), v)
-            .map_err(|e| Error::InputOutput(e.into()))
+        if self.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+            let value = Value::U8(v);
+            value.serialize(self)
+        } else {
+            self.0.prep_serialize_basic::<u8>()?;
+            // Endianness is irrelevant for single bytes.
+            self.0
+                .write_u8(self.0.ctxt.endian(), v)
+                .map_err(|e| Error::InputOutput(e.into()))
+        }
     }
 
     serialize_basic!(serialize_u16(u16) write_u16);
@@ -702,3 +716,233 @@ macro_rules! serialize_struct_named_fields {
 }
 serialize_struct_named_fields!(SerializeStruct);
 serialize_struct_named_fields!(SerializeStructVariant);
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use endi::LE;
+
+    #[test]
+    fn u8_variant() {
+        let input: u8 = 0xA5;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'y' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0xA5, "The u8 value should be encoded");
+    }
+
+    #[test]
+    fn u16_variant() {
+        let input: u16 = 0xDEAD;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'q' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 2-byte boundary");
+        assert_eq!(raw_bytes[4], 0xAD, "The u16 value should be encoded");
+        assert_eq!(raw_bytes[5], 0xDE, "The u16 value should be encoded");
+    }
+
+    #[test]
+    fn u32_variant() {
+        let input: u32 = 0xDEADF00D;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'u' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 4-byte boundary");
+        assert_eq!(raw_bytes[4], 0x0D, "The u32 value should be encoded");
+        assert_eq!(raw_bytes[5], 0xF0, "The u32 value should be encoded");
+        assert_eq!(raw_bytes[6], 0xAD, "The u32 value should be encoded");
+        assert_eq!(raw_bytes[7], 0xDE, "The u32 value should be encoded");
+    }
+
+    #[test]
+    fn u64_variant() {
+        let input: u64 = 0xDEADF00D1337BEEF;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 't' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[4], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[5], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[6], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[7], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[8], 0xEF, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[9], 0xBE, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[10], 0x37, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[11], 0x13, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[12], 0x0D, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[13], 0xF0, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[14], 0xAD, "The u64 value should be encoded");
+        assert_eq!(raw_bytes[15], 0xDE, "The u64 value should be encoded");
+    }
+
+    #[test]
+    fn i16_variant() {
+        let input: i16 = 0x1337;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'n' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 2-byte boundary");
+        assert_eq!(raw_bytes[4], 0x37, "The i16 value should be encoded");
+        assert_eq!(raw_bytes[5], 0x13, "The i16 value should be encoded");
+    }
+
+    #[test]
+    fn i32_variant() {
+        let input: i32 = 0x1337BEEF;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'i' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 4-byte boundary");
+        assert_eq!(raw_bytes[4], 0xEF, "The i32 value should be encoded");
+        assert_eq!(raw_bytes[5], 0xBE, "The i32 value should be encoded");
+        assert_eq!(raw_bytes[6], 0x37, "The i32 value should be encoded");
+        assert_eq!(raw_bytes[7], 0x13, "The i32 value should be encoded");
+    }
+
+    #[test]
+    fn i64_variant() {
+        let input: i64 = 0x1337BEEFDEADF00D;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'x' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[4], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[5], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[6], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[7], 0x00, "Pad to a 8-byte boundary");
+        assert_eq!(raw_bytes[8], 0x0D, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[9], 0xF0, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[10], 0xAD, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[11], 0xDE, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[12], 0xEF, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[13], 0xBE, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[14], 0x37, "The i64 value should be encoded");
+        assert_eq!(raw_bytes[15], 0x13, "The i64 value should be encoded");
+    }
+
+    #[test]
+    fn double_variant() {
+        let input: f64 = 3.0;
+        let ctxt = Context::new_dbus(LE, 0);
+        let data = crate::to_bytes_for_signature(ctxt, "v", &input).unwrap();
+
+        let raw_bytes: &[u8] = data.bytes();
+        assert_eq!(
+            raw_bytes[0], 1,
+            "The variant type signature length should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[1], 'd' as u8,
+            "The variant type signature should be encoded"
+        );
+        assert_eq!(
+            raw_bytes[2], '\0' as u8,
+            "The variant type signature should be null terminated"
+        );
+        assert_eq!(raw_bytes[3], 0x00, "Pad to an 8-byte boundary");
+        assert_eq!(raw_bytes[4], 0x00, "Pad to an 8-byte boundary");
+        assert_eq!(raw_bytes[5], 0x00, "Pad to an 8-byte boundary");
+        assert_eq!(raw_bytes[6], 0x00, "Pad to an 8-byte boundary");
+        assert_eq!(raw_bytes[7], 0x00, "Pad to an 8-byte boundary");
+        assert_eq!(raw_bytes[8], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[9], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[10], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[11], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[12], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[13], 0x00, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[14], 0x08, "The f64 value should be encoded");
+        assert_eq!(raw_bytes[15], 0x40, "The f64 value should be encoded");
+    }
+}

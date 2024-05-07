@@ -11,7 +11,7 @@ use crate::{
     serialized::{Context, Format},
     signature_parser::SignatureParser,
     utils::*,
-    Basic, Error, ObjectPath, Result, Signature,
+    Basic, Error, ObjectPath, Result, Signature, Value,
 };
 
 #[cfg(unix)]
@@ -61,13 +61,18 @@ macro_rules! deserialize_basic {
         where
             V: Visitor<'de>,
         {
-            let v = self
-                .0
-                .ctxt
-                .endian()
-                .$read_method(self.0.next_const_size_slice::<$type>()?);
+            if self.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+                let value: Value<'_> = serde::Deserialize::deserialize(&mut *self)?;
+                return visitor.$visitor_method(value.try_into()?);
+            } else {
+                let v = self
+                    .0
+                    .ctxt
+                    .endian()
+                    .$read_method(self.0.next_const_size_slice::<$type>()?);
 
-            visitor.$visitor_method(v)
+                visitor.$visitor_method(v)
+            }
         }
     };
 }
@@ -167,7 +172,7 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
     where
         V: Visitor<'de>,
     {
-        let v = match self.0.sig_parser.next_char()? {
+        let v: i32 = match self.0.sig_parser.next_char()? {
             #[cfg(unix)]
             Fd::SIGNATURE_CHAR => {
                 self.0.sig_parser.skip_char()?;
@@ -175,6 +180,10 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
                 self.0.parse_padding(alignment)?;
                 let idx = self.0.ctxt.endian().read_u32(self.0.next_slice(alignment)?);
                 self.0.get_fd(idx)?
+            }
+            VARIANT_SIGNATURE_CHAR => {
+                let value: Value<'_> = serde::Deserialize::deserialize(&mut *self)?;
+                value.try_into()?
             }
             _ => self
                 .0
@@ -190,8 +199,13 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deseriali
     where
         V: Visitor<'de>,
     {
-        // Endianness is irrelevant for single bytes.
-        visitor.visit_u8(self.0.next_const_size_slice::<u8>().map(|bytes| bytes[0])?)
+        if self.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
+            let value: Value<'_> = serde::Deserialize::deserialize(&mut *self)?;
+            visitor.visit_u8(value.try_into()?)
+        } else {
+            // Endianness is irrelevant for single bytes.
+            visitor.visit_u8(self.0.next_const_size_slice::<u8>().map(|bytes| bytes[0])?)
+        }
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -671,5 +685,131 @@ impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> EnumAccess<'d
         V: DeserializeSeed<'de>,
     {
         seed.deserialize(&mut *self.de).map(|v| (v, self))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::serialized::Data;
+    use endi::LE;
+
+    #[test]
+    pub fn deserialize_variant_u8() {
+        let bytes = [
+            0x01, 'y' as u8, 0,    // Signature
+            0x08, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: u8 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0x08);
+    }
+
+    #[test]
+    pub fn deserialize_variant_u16() {
+        let bytes = [
+            0x01, 'q' as u8, 0, // Signature
+            0, // Pad to a 2-byte boundary
+            0x0D, 0xF0, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: u16 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0xF00D);
+    }
+
+    #[test]
+    pub fn deserialize_variant_u32() {
+        let bytes = [
+            0x01, 'u' as u8, 0, // Signature
+            0, // Pad to a 4-byte boundary
+            0x0D, 0xF0, 0x37, 0x13, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: u32 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0x1337F00D);
+    }
+
+    #[test]
+    pub fn deserialize_variant_u64() {
+        let bytes = [
+            0x01, 't' as u8, 0, // Signature
+            0, 0, 0, 0, 0, // Pad to a 8-byte boundary
+            0x0D, 0xF0, 0x37, 0x13, 0xEF, 0xBE, 0xBE, 0xBA, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: u64 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0xBABEBEEF1337F00D);
+    }
+
+    #[test]
+    pub fn deserialize_variant_i16() {
+        let bytes = [
+            0x01, 'n' as u8, 0, // Signature
+            0, // Pad to a 2-byte boundary
+            0x37, 0x13, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: i16 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0x1337);
+    }
+
+    #[test]
+    pub fn deserialize_variant_i32() {
+        let bytes = [
+            0x01, 'i' as u8, 0, // Signature
+            0, // Pad to a 4-byte boundary
+            0xBE, 0xBA, 0x37, 0x13, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: i32 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0x1337BABE);
+    }
+
+    #[test]
+    pub fn deserialize_variant_i64() {
+        let bytes = [
+            0x01, 'x' as u8, 0, // Signature
+            0, 0, 0, 0, 0, // Pad to a 8-byte boundary
+            0xCE, 0xFA, 0x0D, 0xF0, 0xBE, 0xBA, 0x37, 0x13, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: i64 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 0x1337BABEF00DFACE);
+    }
+
+    #[test]
+    pub fn deserialize_variant_double() {
+        let bytes = [
+            0x01, 'd' as u8, 0, // Signature
+            0, 0, 0, 0, 0, // Pad to a 8-byte boundary
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // Value
+        ];
+
+        let context = Context::new_dbus(LE, 0);
+        let data = Data::new(&bytes, context);
+
+        let v: f64 = data.deserialize_for_signature("v").unwrap().0;
+        assert_eq!(v, 3.0f64);
     }
 }
